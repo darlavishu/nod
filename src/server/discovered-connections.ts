@@ -1535,7 +1535,13 @@ export async function createDiscoveredConnections(
       const parsed = z
         .object({
           name: proposalSchema.shape.name,
-          endpoint: z.url({ protocol: /^https?$/ }).max(2048),
+          endpoint: z
+            .string()
+            .trim()
+            .transform((value) =>
+              /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`,
+            )
+            .pipe(z.url({ protocol: /^https?$/ }).max(2048)),
           auth: z.enum(['oauth', 'bearer', 'x-api-key']),
           clientIdRequired: z.boolean().optional(),
         })

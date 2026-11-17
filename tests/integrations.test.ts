@@ -7742,6 +7742,16 @@ test(
       },
     ]);
     assert.deepEqual(origins, ['http://127.0.0.1:4931', 'http://127.0.0.1:4931']);
+    const schemeless = await create('127.0.0.1:4931/mcp');
+    assert.equal(schemeless.statusCode, 200, schemeless.body);
+    assert.equal(
+      (
+        await pool.query('SELECT paths FROM discovered_connection_proposals WHERE id=$1', [
+          schemeless.json().id,
+        ])
+      ).rows[0].paths[0].endpoint,
+      'https://127.0.0.1:4931/mcp',
+    );
     for (const endpoint of [
       'http://93.184.216.34/mcp',
       'http://127.0.0.1:4931/mcp?token=synthetic',
