@@ -15,8 +15,12 @@ import {
   apiKeyConnectionProviders,
   lightestEffort,
   modelProviderInfo,
+  modelProviderNames,
   modelProviders,
   modelSource,
+  repriceUsd,
+  type ModelIssue,
+  type ModelSelection,
 } from '../shared/models.ts';
 import type { ProductAnalytics } from '../ports/analytics.ts';
 import { createPostHogAnalytics } from '../providers/posthog/analytics.ts';
@@ -49,6 +53,8 @@ import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type { PasswordManager } from '../ports/password-manager.ts';
 import type { Trash } from '../ports/trash.ts';
 import { desktopTrash } from '../providers/trash.ts';
+import type { KeepAwake } from '../ports/keep-awake.ts';
+import { desktopKeepAwake } from '../providers/keep-awake.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
 import type { DecisionModel, ModelReview } from '../ports/decisions.ts';
 import { createDecisionModel, createOpenRouterDecisionCatalog } from '../providers/decisions.ts';
@@ -62,7 +68,7 @@ import { createN8nFeedback } from '../providers/n8n/feedback.ts';
 import { createN8nTraces } from '../providers/n8n/traces.ts';
 import { createOtlpTelemetry } from '../providers/otlp/telemetry.ts';
 import type { UsageTelemetry } from '../ports/provider-usage.ts';
-import { agentModels } from '../shared/model-defaults.ts';
+import { agentModels, defaultEffort, defaultModel } from '../shared/model-defaults.ts';
 import { createChatSdkTransport } from '../providers/chat-sdk/index.ts';
 import { createWhatsAppLinkedTransport } from '../providers/chat-sdk/whatsapp.ts';
 import { combineMessagingTransports } from '../providers/chat-sdk/combined.ts';
@@ -191,6 +197,7 @@ import {
   stopSignal,
   stopThreadWorkers,
   withTurnLock,
+  workOrigin,
   type TurnRef,
 } from './thread.ts';
 import type { VaultActivityReason } from '../shared/contracts.ts';
@@ -202,6 +209,7 @@ import { createVaultAccess } from './vault-access.ts';
 import { createPayments } from './payments.ts';
 import { BrowserConnectionError, createBrowserConnections } from './browser-connections.ts';
 import { cachedIcons, registerLinkOpened } from './link-previews.ts';
+import { appPages } from '../shared/app-links.ts';
 export interface ApplicationAdapters {
   analytics?: ProductAnalytics;
   onboardingEmail?: OnboardingEmailDelivery;
@@ -220,6 +228,7 @@ export interface ApplicationAdapters {
   keyStore: CredentialKeyStore;
   passwordManager?: PasswordManager;
   trash?: Trash;
+  keepAwake?: KeepAwake;
   localFilesHome?: string;
   memoryCurator?: MemoryCurator;
   classificationCurator?: MemoryCurator;
@@ -239,7 +248,13 @@ export interface ApplicationAdapters {
     managed?: ReturnType<typeof managedChannelEnvironment>;
     create(environment: Record<string, string>): MessagingTransport;
   };
-  model: { provider: string; name: string; configured: boolean; reconnect?: boolean };
+  model: {
+    provider: string;
+    name: string;
+    configured: boolean;
+    reconnect?: boolean;
+    issue?: ModelIssue;
+  };
 }
 
 export function modelEnvironment(
@@ -475,7 +490,7 @@ export function createDefaultAdapters(
     },
     models,
     agent: createPiAgent({
-      resolve: () => models.resolve(),
+      resolve: (choice) => models.resolve(false, choice),
       provider,
       model,
       sessionRoot: join(dataRoot, 'sessions'),
@@ -487,6 +502,7 @@ export function createDefaultAdapters(
       open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
     }),
     trash: desktopMode ? desktopTrash() : undefined,
+    keepAwake: desktopMode ? desktopKeepAwake() : undefined,
     workspace: createDockerWorkspace({
       container: env.WORKSPACE_CONTAINER || 'nod-workspace',
       workspaceRoot: join(dataRoot, 'workspaces'),
@@ -629,6 +645,8 @@ export function createDefaultAdapters(
             mode,
             allowedNumber: configured.WHATSAPP_ALLOWED_NUMBER,
             store: createChannelSessionStore({ pool, ownerId, keyStore }),
+            onDrop: (drop) =>
+              logFailure('channel_message_dropped', null, { provider: 'whatsapp', ...drop }),
           }),
         );
       },
@@ -654,6 +672,26 @@ export function createDefaultAdapters(
   };
 }
 
+function alternativeModel(models: ApplicationAdapters['models']) {
+  const view = models?.view();
+  const other = view?.connections.find(
+    (item) =>
+      item.id !== view.selection?.connectionId &&
+      item.status === 'connected' &&
+      item.models.length > 0,
+  );
+  const choice =
+    other && (defaultModel(other.provider, other.models, other.method) ?? other.models[0]);
+  return other && choice && !models?.issue({ connectionId: other.id, modelId: choice.id })
+    ? {
+        connectionId: other.id,
+        modelId: choice.id,
+        effort: defaultEffort(other.provider, choice),
+        label: `${modelProviderNames[other.provider]} · ${choice.name}`,
+      }
+    : undefined;
+}
+
 export async function createApplication(
   adapters: ApplicationAdapters,
   options: {
@@ -665,10 +703,11 @@ export async function createApplication(
 ) {
   const diagnostics: {
     log?: Awaited<ReturnType<typeof createFeedbackLog>>;
+    failures?: Awaited<ReturnType<typeof createFeedbackLog>>;
     failure: FailureLogSink;
   } = {
     failure: (event, error, context) =>
-      diagnostics.log?.record('failure', { event, error, context }, context),
+      diagnostics.failures?.record('failure', { event, error, context }, context),
   };
   try {
     return await withFailureLog(diagnostics.failure, () =>
@@ -676,6 +715,7 @@ export async function createApplication(
     );
   } catch (error) {
     await diagnostics.log?.close().catch(() => {});
+    await diagnostics.failures?.close().catch(() => {});
     try {
       await adapters.analytics?.shutdown();
     } catch {}
@@ -694,7 +734,11 @@ async function initializeApplication(
     heartbeat?: boolean;
     runtimeReady?: Promise<void>;
   },
-  diagnostics: { log?: Awaited<ReturnType<typeof createFeedbackLog>>; failure: FailureLogSink },
+  diagnostics: {
+    log?: Awaited<ReturnType<typeof createFeedbackLog>>;
+    failures?: Awaited<ReturnType<typeof createFeedbackLog>>;
+    failure: FailureLogSink;
+  },
 ) {
   const analytics = await createAnalytics({
     provider: adapters.analytics,
@@ -829,6 +873,12 @@ async function initializeApplication(
   const onboardingCurator = adapters.onboardingCurator
     ? ledger.curator(adapters.onboardingCurator)
     : curator;
+  void adapters.models?.setSelectionCheck(() =>
+    onboardingCurator.curate(
+      { task: 'check', instructions: 'Return only {"ok":true}.', input: {}, automatic: false },
+      AbortSignal.timeout(30_000),
+    ),
+  );
   const decisions = adapters.decisions && ledger.decisions(adapters.decisions);
   const review: ModelReview = async (instructions, input, signal, question) => {
     if (question) {
@@ -1017,10 +1067,59 @@ async function initializeApplication(
     memory,
     learnedSkills,
     models: adapters.models,
+    localFilesAvailable: Boolean(adapters.trash),
     consumers,
     stopConsumer: (id) => boss.offWork('scheduled-task', { id, wait: true }),
+    taskModels: {
+      list: () => tasks.ownModels(),
+      title: (id) => tasks.modelTask(id),
+      set: (client, id, model) => tasks.setModel(client ?? pool, id, model, 'agent'),
+    },
+    modelProjection: async (scope, id, model) => {
+      const models = adapters.models;
+      if (!models) return null;
+      const usage = await ledger.workUsage();
+      const spent =
+        scope === 'schedule'
+          ? usage.schedules[id!]
+          : scope === 'task'
+            ? usage.tasks[id!]
+            : usage.lanes[
+                scope === 'schedules' ? 'schedule' : scope === 'background' ? 'background' : 'chat'
+              ];
+      const last30Usd = spent ? spent.agentUsd + spent.otherUsd : 0;
+      if (!spent || last30Usd <= 0) return null;
+      const origin =
+        scope === 'schedules' || scope === 'schedule'
+          ? { kind: 'schedule' as const }
+          : scope === 'background'
+            ? { kind: 'background' as const }
+            : scope === 'task'
+              ? ((await tasks.workOf(id!)) ?? { kind: 'chat' as const })
+              : { kind: 'chat' as const };
+      const target = models.priceOf(
+        model === 'light'
+          ? (models.light() ?? models.view().selection)
+          : (model ?? models.workModel(origin).selection),
+      );
+      if (!target) return null;
+      const withChoiceUsd =
+        spent.models.length === 1 && spent.models[0] === target.modelId
+          ? last30Usd
+          : repriceUsd(spent, target.pricing);
+      return { last30Usd, withChoiceUsd };
+    },
     sessionCosts: ledger.sessionCosts,
+    sessionUsage: ledger.sessionUsage,
     recentTurnCost: ledger.recentTurnCost,
+    ...(adapters.models
+      ? {
+          validateModel: (choice: ModelSelection) => adapters.models!.validateChoice(choice),
+          workPricing: (own: ModelSelection | null) => adapters.models!.pricing('schedule', own),
+          modelPaused: (model: ModelSelection | null) =>
+            adapters.models!.paused({ kind: 'schedule', schedule: model }),
+        }
+      : {}),
     watchable: async (connectionIds) => integrations.watchable(connectionIds),
     watchState: async (connectionIds) => integrations.watchState(connectionIds),
   });
@@ -1031,12 +1130,61 @@ async function initializeApplication(
     analytics: captureAnalytics,
     refresh,
     clearBrowser: (id) => adapters.computer.clear(id),
+    ...(adapters.models
+      ? { validateModel: (choice: ModelSelection) => adapters.models!.validateChoice(choice) }
+      : {}),
   });
   await tasks.initialize();
+  async function describeModelChoice(input: Record<string, unknown>) {
+    const models = adapters.models;
+    if (!models) return undefined;
+    const view = models.view();
+    const scope = String(input.scope ?? 'chat');
+    const id = typeof input.id === 'string' ? input.id : undefined;
+    const lane = scope === 'schedules' || scope === 'schedule' ? 'schedule' : 'background';
+    const choice =
+      input.use === 'light'
+        ? (view.light ?? view.selection)
+        : input.use === 'same'
+          ? scope === 'schedule' || scope === 'task'
+            ? models.workModel(
+                scope === 'task' && id
+                  ? ((await tasks.workOf(id)) ?? { kind: 'chat' })
+                  : { kind: lane },
+              ).selection
+            : view.selection
+          : { connectionId: String(input.connectionId), modelId: String(input.modelId) };
+    const connection = view.connections.find((item) => item.id === choice?.connectionId);
+    const model = connection?.models.find((item) => item.id === choice?.modelId);
+    if (!connection || !model) return undefined;
+    const work =
+      scope === 'schedule'
+        ? id
+          ? `the schedule "${(await personal.getSchedule(id)).title}"`
+          : 'the schedule being created'
+        : scope === 'task'
+          ? id
+            ? `the task "${await tasks.modelTask(id)}"`
+            : 'the task being started'
+          : {
+              chat: 'when the owner talks to Nod',
+              schedules: 'schedules without their own model',
+              background: 'work Nod starts on its own',
+            }[scope];
+    return {
+      service: modelSource(connection),
+      account: connection.label,
+      model: model.name,
+      for: work,
+      ...(input.use === 'light' ? { choice: 'the light model' } : {}),
+      ...(input.use === 'same' ? { choice: 'back to the default' } : {}),
+    };
+  }
   const activity = createActivity({
     pool,
     ownerId,
     model: () => adapters.models?.current.label,
+    keepAwake: adapters.keepAwake,
   });
   const observedSource = (catalog: ObservationSource[], id: string) =>
     catalog.find((source) => source.id === id) ??
@@ -1110,17 +1258,26 @@ async function initializeApplication(
     trash: adapters.trash,
     available: Boolean(adapters.trash),
   });
-  const preparationPaused = async () => {
+  const preparationBlocked = async () => {
+    if ((await ledger.preparationLimit()).reached)
+      return 'the monthly preparation allowance is reached';
+    const unpriced = adapters.models?.unpricedPreparationModel();
+    if (unpriced) return `${unpriced} has no price, so the preparation allowance cannot bound it`;
+  };
+  const preparationPause = async () => {
     const prefs = await speechPreferences.get();
-    return prefs.proactivePaused || isQuietTime(prefs) || (await ledger.preparationLimit()).reached;
+    if (prefs.proactivePaused) return 'automatic preparation is paused';
+    if (isQuietTime(prefs)) return 'it is quiet hours';
+    return preparationBlocked();
   };
   const integrations = await createIntegrations(pool, {
     localFiles,
     mailCheck: async (...args) => {
-      if (await preparationPaused()) return args[0].map(() => undefined);
+      const pause = await preparationPause();
+      if (pause) return args[0].map(() => `background email checks wait because ${pause}`);
       return ledger.withPreparation(randomUUID(), () => mailCheck(...args));
     },
-    paused: preparationPaused,
+    paused: async () => Boolean(await preparationPause()),
     analytics: captureAnalytics,
     analyticsConsent,
     admission,
@@ -1541,7 +1698,7 @@ async function initializeApplication(
         await personal.validateReview(action.slice('NOD_'.length), args, expectedRevision, client);
       } else await integrations.prepare(ownerId, action, args, undefined, undefined, false, client);
     },
-    (reply) => trust.answer(reply),
+    (reply) => ledger.forOwner(() => trust.answer(reply)),
     communication.describe,
     captureAnalytics,
   );
@@ -1695,29 +1852,32 @@ async function initializeApplication(
       }
     | undefined;
   const feedbackSecrets = [ownerId, ...secrets];
-  diagnostics.log = await createFeedbackLog({
+  const sanitizeDiagnostics = async (value: unknown) => {
+    const profile = await (feedbackProfileRead ??= ownerProfile().finally(() => {
+      feedbackProfileRead = undefined;
+    }));
+    for (let index = feedbackSecrets.length - 1; index < secrets.length; index++)
+      feedbackSecrets.push(secrets[index]);
+    if (
+      !feedbackRedaction ||
+      feedbackRedaction.profile.region !== profile.region ||
+      feedbackRedaction.profile.names.length !== profile.names.length ||
+      feedbackRedaction.profile.names.some((name, index) => name !== profile.names[index])
+    )
+      feedbackRedaction = {
+        profile,
+        redact: createFeedbackRedactor({ secrets: feedbackSecrets, profile }),
+      };
+    const { redact } = feedbackRedaction;
+    if (!redact.isReady()) throw new Error('Diagnostic redaction unavailable.');
+    return redact.value(value);
+  };
+  diagnostics.log = await createFeedbackLog({ dataRoot, ownerId, sanitize: sanitizeDiagnostics });
+  diagnostics.failures = await createFeedbackLog({
     dataRoot,
     ownerId,
-    sanitize: async (value) => {
-      const profile = await (feedbackProfileRead ??= ownerProfile().finally(() => {
-        feedbackProfileRead = undefined;
-      }));
-      for (let index = feedbackSecrets.length - 1; index < secrets.length; index++)
-        feedbackSecrets.push(secrets[index]);
-      if (
-        !feedbackRedaction ||
-        feedbackRedaction.profile.region !== profile.region ||
-        feedbackRedaction.profile.names.length !== profile.names.length ||
-        feedbackRedaction.profile.names.some((name, index) => name !== profile.names[index])
-      )
-        feedbackRedaction = {
-          profile,
-          redact: createFeedbackRedactor({ secrets: feedbackSecrets, profile }),
-        };
-      const { redact } = feedbackRedaction;
-      if (!redact.isReady()) throw new Error('Diagnostic redaction unavailable.');
-      return redact.value(value);
-    },
+    name: 'failures',
+    sanitize: sanitizeDiagnostics,
   });
   adapters.traces?.configure({
     enabled: (await localAccounts.read(ownerId)).traces,
@@ -1827,9 +1987,9 @@ async function initializeApplication(
     curator: adapters.classificationCurator && ledger.curator(adapters.classificationCurator),
     analytics: captureAnalytics,
     modelAvailable: async () =>
-      !(await ledger.preparationLimit()).reached &&
+      !(await preparationBlocked()) &&
       (adapters.models
-        ? await adapters.models.automaticRequestsAllowed()
+        ? await adapters.models.automaticRequestsAllowed({ kind: 'background' }, true)
         : adapters.model.configured),
     redact: createTextRedactor(secrets),
     sources: (client) => observations.sources(client),
@@ -1941,6 +2101,23 @@ async function initializeApplication(
       taskChecks: tasks.resumeDue,
       analytics: captureAnalytics,
       currentModel: () => adapters.model,
+      ...(adapters.models
+        ? {
+            workModel: async (turnId: string) => {
+              const origin = await workOrigin(turnId);
+              if (!origin) return undefined;
+              const { selection } = adapters.models!.workModel(origin);
+              const { provider, name } = adapters.models!.describe(selection);
+              return { selection, provider, name };
+            },
+          }
+        : {}),
+      modelAlternative: () => {
+        const other = alternativeModel(adapters.models);
+        return other
+          ? `Your ${other.label} connection is also set up: you can switch to it in ${appPages['/settings/models']}.`
+          : undefined;
+      },
       taskClassification: true,
       observeTurn: (turnId, operation) =>
         analytics
@@ -1990,7 +2167,7 @@ async function initializeApplication(
                 .runTurn({ ...context, runtimeHost: desktopMode ? 'desktop' : 'server' })
                 .finally(() => proactivity.release(context.turnId)),
             Boolean(context.spendingLimitReached),
-            !context.currentMessageId,
+            Boolean(context.automatic),
           );
         return automaticWork ? ledger.withPreparation(context.turnId, run) : run();
       },
@@ -2008,7 +2185,41 @@ async function initializeApplication(
       taskContext: tasks.context,
       settleTask: tasks.settle,
       taskLedger: tasks.read,
-      task: tasks.execute,
+      task: async (turn, raw, sourceMessageId, priorMessageId, priorHandoff) => {
+        const request = raw as { action?: unknown; model?: unknown } | undefined;
+        if (request?.action === 'start' && request.model) {
+          const current = (
+            await pool.query<{ proactive: boolean; chat: boolean }>(
+              'SELECT proactive,session_id=thread_id AS chat FROM turns WHERE id=$1 AND owner_id=$2',
+              [turn.turnId, ownerId],
+            )
+          ).rows[0];
+          if (!current?.chat || current.proactive)
+            throw new Error('Only a task the owner starts from chat can have its own model.');
+          const choice = await personal.validateReview('model_select', {
+            scope: 'chat',
+            ...(request.model as Record<string, unknown>),
+          });
+          const verdict = await trust.check(turn, 'NOD_model_select', {
+            ...choice,
+            scope: 'task',
+            targetModel: await describeModelChoice({ ...choice, scope: 'task' }),
+          });
+          if (verdict.confirm)
+            throw new Error(
+              'The owner did not ask for a model for this task. Start it without model, or ask the owner first.',
+            );
+          const { connectionId, modelId, effort } = choice as Record<string, unknown>;
+          return tasks.execute(
+            turn,
+            { ...(raw as object), model: { connectionId, modelId, effort } },
+            sourceMessageId,
+            priorMessageId,
+            priorHandoff,
+          );
+        }
+        return tasks.execute(turn, raw, sourceMessageId, priorMessageId, priorHandoff);
+      },
       startTurn: async (turn) => {
         const origin = await turnOrigin(turn.turnId);
         if (origin?.source === 'schedule')
@@ -2194,17 +2405,15 @@ async function initializeApplication(
               : undefined;
           const rule = 'notificationRule' in input ? preferences?.notificationRule : undefined;
           const rules = 'rules' in input ? preferences?.rules : undefined;
-          const connection =
+          const targetModel =
             action === 'model_select'
-              ? adapters.models?.view().connections.find((item) => item.id === input.connectionId)
-              : undefined;
-          const targetModel = connection
-            ? {
-                service: modelSource(connection),
-                account: connection.label,
-                model: connection.models.find((item) => item.id === input.modelId)!.name,
-              }
-            : undefined;
+              ? await describeModelChoice(input)
+              : action === 'schedule_create' && input.model
+                ? await describeModelChoice({
+                    scope: 'schedule',
+                    ...(input.model as ModelSelection),
+                  })
+                : undefined;
           const verdict = await trust.check(
             turn,
             `NOD_${action}`,
@@ -2411,6 +2620,23 @@ async function initializeApplication(
           );
           return result;
         }
+        if (isLocalFilesAction(action) && localFiles.available && !(await localFiles.enabled())) {
+          await localFiles.assertStartedByOwner(turn);
+          const input = { localFilesEnabled: true };
+          const verdict = await trust.check(turn, 'NOD_notification_preferences_update', input);
+          return approvals.request(turn, 'NOD_notification_preferences_update', input, {
+            allowed: !verdict.confirm,
+            ...(verdict.confirm ? {} : { basis: verdict.basis }),
+            signal: options.signal,
+            admit: options.admit,
+            expectedChatRevision: verdict.chatRevision,
+            details: {
+              ...(typeof args.path === 'string' ? { requestedPath: args.path } : {}),
+              accessScope:
+                'Enable local file access in the home folder and external drives for work the owner starts. Hidden files, secrets, private system folders and kept-out folders stay blocked. This enables the setting only; the requested file action has not run.',
+            },
+          });
+        }
         const prepare = () =>
           hasWorkspaceFiles(args)
             ? withTurnLock(turn.turnId, (client) =>
@@ -2570,14 +2796,18 @@ async function initializeApplication(
     activity: activity.current,
     planningTasks: onboardingSuggestions.planning,
     computer,
-    configuration: () =>
-      configuration({
+    configuration: () => {
+      const alternative = alternativeModel(adapters.models);
+      return configuration({
         provider: adapters.model.provider,
         model: adapters.model.name,
         llmReady: adapters.model.configured,
         modelReconnect: adapters.model.reconnect === true,
+        ...(adapters.model.issue ? { modelIssue: adapters.model.issue } : {}),
+        ...(alternative ? { modelAlternative: alternative } : {}),
         integrationsReady: adapters.integrations.configured,
-      }),
+      });
+    },
   });
   adapters.models?.register(app, captureAnalytics);
   proactivity.registerRoutes(app);
@@ -2591,6 +2821,9 @@ async function initializeApplication(
     secrets,
     profile: ownerProfile,
     logs: () => diagnostics.log!.snapshot(),
+    failures: () => diagnostics.failures!.snapshot(),
+    dataRoot,
+    trustModel: adapters.trustModel ?? 'selected',
     context: await feedbackContext({ environment: process.env }),
     get provider() {
       return adapters.model.provider;
@@ -2609,11 +2842,12 @@ async function initializeApplication(
       submit: async (input) => ({ submissionId: input.submissionId, status: 'rejected' }),
       status: async (submissionId) => ({ submissionId, status: 'rejected' }),
     },
-    buildReport: (activity, errors, errorsAvailable) =>
+    buildReport: (activity, errors, errorsAvailable, client) =>
       buildFeedbackReport({
         ...feedbackReportOptions,
         errors,
         errorsAvailable,
+        client,
         activity: [...feedbackActivity.snapshot(), ...activity].sort((a, b) => b.ageMs - a.ageMs),
       }),
     analytics: captureAnalytics,
@@ -2722,7 +2956,8 @@ async function initializeApplication(
       ...(channelSettings ? { pair: channelSettings.pair } : {}),
       transport: messaging,
       isRetirableScheduleConfirmation: approvals.isRetirableScheduleConfirmation,
-      classifyRetiredReply: trust.classifyRetiredReply,
+      classifyRetiredReply: (reply, expired) =>
+        ledger.forOwner(() => trust.classifyRetiredReply(reply, expired)),
       acceptVerification: (text, input) => chatVerification.accept(text, input),
       reacted: (messageId, reaction) => reactToMessage(messageId, reaction),
       activeThread: (client) => lockThread(client),
@@ -2862,6 +3097,7 @@ async function initializeApplication(
       () => analytics.shutdown(),
       () => adapters.telemetry?.shutdown(),
       () => diagnostics.log?.close(),
+      () => diagnostics.failures?.close(),
     ]) {
       try {
         await close();

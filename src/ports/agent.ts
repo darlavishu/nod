@@ -13,6 +13,7 @@ import type {
   SpeechReplyMode,
 } from '../shared/contracts.ts';
 import type { ProactiveIssue } from '../shared/proactivity.ts';
+import type { ModelSelection } from '../shared/models.ts';
 import type { MemoryBrief } from './memory-recall.ts';
 
 export interface ModelUsageObservation {
@@ -121,6 +122,7 @@ export interface RuntimeContext {
   audioCaption?: string;
   background?: boolean;
   scheduleCache?: 'short' | 'long';
+  model?: ModelSelection;
   channel?: string;
   runtimeHost?: 'desktop' | 'server';
   timeZone?: string;
@@ -134,6 +136,7 @@ export interface RuntimeContext {
   localFiles?: boolean;
   mcpServers?: ConnectedMcpServer[];
   currentMessageId?: string;
+  automatic?: boolean;
   speech?: { mode: SpeechReplyMode; available: boolean };
   firstConversationTurn?: boolean;
   replyTo?: {
@@ -355,6 +358,7 @@ export interface AgentToolOutcome {
   error?: string;
 }
 export interface AgentSessionOptions extends ExecutionScope {
+  model?: ModelSelection;
   automatic?: boolean;
   restricted?: boolean;
   ephemeral?: boolean;

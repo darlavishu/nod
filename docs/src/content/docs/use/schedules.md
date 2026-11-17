@@ -16,7 +16,7 @@ Ask in chat. For example:
 - "Every weekday at 8:00, summarize my calendar and anything urgent in my inbox."
 - "Tomorrow at 15:00, remind me to call the landlord."
 
-A schedule runs **One time** or is **Recurring**. Nod tells you when it's saved and when it runs next. If you ask for a schedule that's already active with the same name or instruction, time and chat, Nod keeps the one you have instead of adding a copy. When you hand Nod work that needs follow-up, it can also plan its own check-in, such as "I'll look for a reply on Friday". Check-ins are schedules too.
+A schedule runs **One time** or is **Recurring**. Nod tells you when it's saved and when it runs next. If you ask for a schedule that's already active with the same name or instruction, time and chat, Nod keeps the one you have instead of adding a copy, and uses the model you named for it, if any. When you hand Nod work that needs follow-up, it can also plan its own check-in, such as "I'll look for a reply on Friday". Check-ins are schedules too.
 
 Nod uses your time zone, saved from your browser the first time you use Nod. Change it in **Settings → General**. If Nod doesn't know your time zone, it asks.
 
@@ -90,6 +90,8 @@ The first time Nod messages you about something on its own, such as a calendar c
 ## Edit schedule details
 
 Select **Edit schedule** to review its name, instructions and timing together. Timing changes preview the next run without changing the saved schedule. **Save changes** applies only the fields you changed, so renaming a schedule keeps its next run. Editing the complete work instruction supplies a new complete instruction. A name or timing edit keeps the existing work and its permission limits. **Cancel** closes the editor without saving.
+
+A schedule uses the model for schedules from **Settings > Models**. To give one schedule its own model, open **See details** and select **Change** beside **Model**. When a recurring schedule shows a projected monthly cost, it prices the schedule's recent runs on that model. See [Models for each kind of work](/connect/models/#models-for-each-kind-of-work).
 
 **Undo** restores the previous values only if no newer change has replaced them. The Undo notice stays available while you hover over it, focus it, or switch away from Nod. If the schedule changes while you edit, your draft stays open so you can review it.
 

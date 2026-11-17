@@ -1,5 +1,6 @@
 import { presentationInputSchema, type Presentation } from '../shared/presentation.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
+import { appPages } from '../shared/app-links.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -887,7 +888,8 @@ export function createAgentRuntime(dependencies: {
         try {
           child = await agent.open({
             ...source,
-            automatic: !context.currentMessageId,
+            ...(context.model ? { model: context.model } : {}),
+            automatic: Boolean(context.automatic),
             ephemeral: true,
             systemPrompt: system,
             ownerContext: ownerContext(context),
@@ -1056,7 +1058,8 @@ export function createAgentRuntime(dependencies: {
       await context.emit('agent_start', 'Main agent', { execution });
       const opening = agent.open({
         ...execution,
-        automatic: !context.currentMessageId,
+        ...(context.model ? { model: context.model } : {}),
+        automatic: Boolean(context.automatic),
         ...(context.proactivity ? { restricted: true, restartable: !context.resumed } : {}),
         ...(context.scheduleCache ? { scheduleCache: context.scheduleCache } : {}),
         ...(sessionId === threadId && !context.proactivity && dependencies.keepWarm
@@ -1270,7 +1273,7 @@ export function createAgentRuntime(dependencies: {
       if (modelIncomplete && status === 'succeeded')
         throw new Error(
           modelIncomplete === 'context'
-            ? 'The model response was cut off because its context is full. Start a new conversation or choose a model with a larger context.'
+            ? `The model response was cut off at its context limit. Try a shorter instruction or choose a model with more context in ${appPages['/settings/models']}.`
             : 'The model response was incomplete. Say continue to try again.',
         );
       if (stopped && status === 'succeeded') throw new Error('The turn was stopped.');

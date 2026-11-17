@@ -33,7 +33,7 @@ const nodActions: Array<[string, string]> = [
   ['NOD_vault_allow', 'Use a saved sign-in'],
   ['NOD_limits_update', 'Change spending limits'],
   ['NOD_model_select', 'Change the model'],
-  ['NOD_notification_preferences_update', 'Change notifications'],
+  ['NOD_notification_preferences_update', 'Change Nod settings'],
   ['NOD_schedule_pause', 'Pause a schedule'],
   ['NOD_schedule_cancel', 'Pause a schedule'],
   ['NOD_schedule_create', 'Create a schedule'],
@@ -238,6 +238,7 @@ export function approvalContent(
 }
 
 const tools: Record<string, string> = {
+  codemode: 'Ran code',
   bash: 'Ran a command',
   read: 'Read a file',
   write: 'Wrote a file',
@@ -348,8 +349,14 @@ export function actionTarget(
     }
     if (action.startsWith('NOD_schedule_'))
       return words(args.title ?? (details?.schedule as { title?: unknown } | undefined)?.title)[0];
-    if (action === 'NOD_model_select')
-      return words((details?.targetModel as { model?: unknown } | undefined)?.model)[0];
+    if (action === 'NOD_model_select') {
+      const target = details?.targetModel as { model?: unknown; for?: unknown } | undefined;
+      const model = words(target?.model)[0];
+      const work = words(target?.for)[0];
+      return model && work && work !== 'when the owner talks to Nod'
+        ? `${model} for ${work}`
+        : model;
+    }
     if (action === 'NOD_limits_update')
       return [
         'monthlyUsd' in args && dollarsOrNone(args.monthlyUsd, 'monthly limit'),

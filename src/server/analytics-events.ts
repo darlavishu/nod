@@ -263,6 +263,7 @@ export const analyticsEvent = z.discriminatedUnion('event', [
             'quiet_start',
             'quiet_end',
             'proactivity_paused',
+            'local_files_access',
             'memory_enabled',
             'memory_sensitive',
             'monthly_spending_limit',
@@ -270,6 +271,10 @@ export const analyticsEvent = z.discriminatedUnion('event', [
             'preparation_spending_limit',
             'model_selection',
             'model_effort',
+            'model_route_schedule',
+            'model_route_background',
+            'schedule_model',
+            'task_model',
           ]),
           actor: z.enum(['owner', 'agent', 'system']),
           state: z

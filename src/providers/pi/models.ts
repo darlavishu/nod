@@ -5,6 +5,8 @@ import {
   getSystemMessageText,
   hasApi,
   createAssistantMessageEventStream,
+  isContextOverflow,
+  isRetryableAssistantError,
   type Api,
   type AssistantMessage,
   type Context,
@@ -15,7 +17,9 @@ import { ModelRuntime, type ProviderModelConfig } from '@earendil-works/pi-codin
 import { Agent, Dispatcher1Wrapper } from 'undici';
 import { z } from 'zod';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
+import { logFailure } from '../../ports/failure-log.ts';
 import { ModelAuthError, ModelWorkspaceSelectionError } from '../../ports/models.ts';
+import { appPages } from '../../shared/app-links.ts';
 import { ElevenLabsConnectionError, readElevenLabsVoices } from '../elevenlabs/speech.ts';
 import { openAIBaseUrl, openAIRequestError } from '../openai/api.ts';
 import type {
@@ -26,6 +30,7 @@ import type {
 } from '../../ports/models.ts';
 import {
   bedrockRegionPattern,
+  boundedPrice,
   modelProviders,
   modelProviderNames,
   type ModelProvider,
@@ -49,7 +54,10 @@ import {
   nativeCatalog,
 } from './model-catalog.ts';
 
+const reconnectChatGpt = `Reconnect your ChatGPT account in ${appPages['/settings/models']}.`;
+
 export const localModelSilenceMs = 30 * 60_000;
+export const modelFirstEventMs = 90_000;
 
 function supportedModel(model: Model<Api>): Model<Api> {
   if (model.provider === 'groq' && model.id.startsWith('qwen/'))
@@ -100,8 +108,7 @@ class AnthropicBadRequest extends ModelAuthError {}
 
 function chatgptCredential(value: unknown) {
   const parsed = chatgptCredentialSchema.safeParse(value);
-  if (!parsed.success)
-    throw new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+  if (!parsed.success) throw new ModelAuthError(reconnectChatGpt, true);
   return parsed.data;
 }
 
@@ -443,7 +450,9 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     async signIn({ signal: requestedSignal, hostId, previous }) {
       const controller = new AbortController();
       const signal = AbortSignal.any([requestedSignal, controller.signal]);
-      const canceled = () => new ModelAuthError('ChatGPT sign-in was canceled.');
+      const refused = (message: string, reason: string) =>
+        new ModelAuthError(message, false, { cause: { reason } });
+      const canceled = (reason = 'aborted') => refused('ChatGPT sign-in was canceled.', reason);
       if (signal.aborted) throw canceled();
       const saved = chatgptCredentialSchema.safeParse(previous).data;
       const state = random();
@@ -479,7 +488,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       const expected = new URL(callbackUrl);
       const complete = (callback: URL) => {
         if (settled || claimed || signal.aborted)
-          throw new ModelAuthError('This sign-in request has expired. Start a new connection.');
+          throw refused('This sign-in request has expired. Start a new connection.', 'expired');
         if (
           callback.origin !== expected.origin ||
           callback.pathname !== expected.pathname ||
@@ -489,15 +498,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           callback.searchParams.getAll('state').length !== 1 ||
           callback.searchParams.get('state') !== state
         )
-          throw new ModelAuthError('This sign-in callback is invalid or was declined.');
+          throw refused('This sign-in callback is invalid or was declined.', 'callback_mismatch');
         if (callback.searchParams.has('error')) {
           if (
             callback.searchParams.getAll('error').length !== 1 ||
             !callback.searchParams.get('error') ||
             callback.searchParams.has('code')
           )
-            throw new ModelAuthError('This sign-in callback is invalid.');
-          const declined = canceled();
+            throw refused('This sign-in callback is invalid.', 'invalid_callback');
+          const declined = canceled('declined');
           claimed = true;
           refuse(declined);
           throw declined;
@@ -512,7 +521,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             ? issued[0]
             : undefined;
         if (codes.length !== 1 || !codes[0] || !clientId)
-          throw new ModelAuthError('This sign-in callback is invalid.');
+          throw refused('This sign-in callback is invalid.', 'invalid_callback');
         claimed = true;
         grant({ code: codes[0], clientId });
       };
@@ -534,7 +543,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             () => send(200),
             () => send(400),
           );
-        } catch {
+        } catch (error) {
+          if (!claimed)
+            logFailure('model_sign_in_failed', Object(error).cause, {
+              provider: 'openai',
+              reason: Object(Object(error).cause).reason,
+              phase: 'callback',
+            });
           send(400);
         }
       });
@@ -563,10 +578,18 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         signal.removeEventListener('abort', abort);
         await close();
         if (error instanceof ModelAuthError) throw error;
+        const busy = error instanceof Error && 'code' in error && error.code === 'EADDRINUSE';
         throw new ModelAuthError(
-          error instanceof Error && 'code' in error && error.code === 'EADDRINUSE'
+          busy
             ? 'Port 1455 is already in use. Close the other Nod app or another sign-in, then try again.'
             : 'ChatGPT sign-in couldn’t start. Try again.',
+          false,
+          {
+            cause: {
+              reason: busy ? 'callback_port_unavailable' : 'callback_server_failed',
+              code: Object(error).code,
+            },
+          },
         );
       }
       exchange = (async (): Promise<ModelCredential> => {
@@ -760,7 +783,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         if (response.status !== 401) return response;
         await response.body?.cancel();
         throw method === 'subscription'
-          ? new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true)
+          ? new ModelAuthError(reconnectChatGpt, true)
           : new ModelAuthError(
               `${modelProviderNames[provider]} didn’t accept this API key. Check it and try again.`,
             );
@@ -962,9 +985,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const terminal =
           error instanceof TokenRejected && [400, 401, 403].includes(error.statusCode);
         throw new ModelAuthError(
-          terminal
-            ? 'Reconnect your ChatGPT account in Settings > Models.'
-            : 'ChatGPT is temporarily unavailable. Try again.',
+          terminal ? reconnectChatGpt : 'ChatGPT is temporarily unavailable. Try again.',
           terminal,
           { cause: error },
         );
@@ -1026,7 +1047,7 @@ export async function createPiModelRuntime(
   const provider = access.provider;
   const reconnect = async (credential?: ModelCredential) => {
     await access.needsReconnect?.(credential);
-    return new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+    return new ModelAuthError(reconnectChatGpt, true);
   };
   if (
     subscription &&
@@ -1151,6 +1172,9 @@ export async function createPiModelRuntime(
     let transportCause: string | undefined;
     let completeRequest: ((error?: string) => Promise<void>) | undefined;
     let settleBudget: ((spentUsd: number | null) => Promise<void>) | undefined;
+    const silence = new AbortController();
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined;
+    const heard = () => clearTimeout(silenceTimer);
     const guardedFetch =
       access.provider === 'compatible' ||
       access.provider === 'radius' ||
@@ -1166,6 +1190,7 @@ export async function createPiModelRuntime(
     const output = Math.min(options?.maxTokens ?? target.maxTokens, target.maxTokens);
     const upstream = stream(target, replay, {
       ...options,
+      signal: options?.signal ? AbortSignal.any([options.signal, silence.signal]) : silence.signal,
       maxTokens: output,
       maxRetries: 0,
       onResponse: async (response, model) => {
@@ -1174,6 +1199,7 @@ export async function createPiModelRuntime(
         await options?.onResponse?.(response, model);
       },
       onProviderStreamEvent: async (event, model) => {
+        heard();
         phase = 'stream';
         await options?.onProviderStreamEvent?.(event, model);
       },
@@ -1315,11 +1341,7 @@ export async function createPiModelRuntime(
           : body;
         settleBudget = await access.reserve?.(() => {
           const prices = target.cost;
-          return prices &&
-            [prices.input, prices.output, prices.cacheRead, prices.cacheWrite].every(
-              (price) => Number.isFinite(price) && price >= 0,
-            ) &&
-            Math.max(prices.input, prices.output, prices.cacheRead, prices.cacheWrite) > 0
+          return boundedPrice(prices)
             ? (Buffer.byteLength(JSON.stringify(prepared)) *
                 Math.max(prices.input * 2, prices.cacheWrite, prices.cacheRead) +
                 output * prices.output) /
@@ -1327,6 +1349,11 @@ export async function createPiModelRuntime(
             : null;
         });
         phase = 'payload';
+        if (access.provider !== 'compatible') {
+          heard();
+          silenceTimer = setTimeout(() => silence.abort(), modelFirstEventMs);
+          silenceTimer.unref?.();
+        }
         return prepared;
       },
     });
@@ -1346,13 +1373,26 @@ export async function createPiModelRuntime(
               }),
             ),
           );
+        if (event.type === 'done' || event.type === 'error') heard();
+        if (event.type === 'error' && silence.signal.aborted && !options?.signal?.aborted) {
+          event.error.stopReason = 'error';
+          event.error.errorMessage = `${modelProviderNames[access.provider]} sent no response for ${modelFirstEventMs / 1000} seconds, so the request timed out.`;
+        }
         if (event.type === 'error') {
           const error = event.error;
           error.errorMessage = `${error.errorMessage || 'The provider gave no reason.'}${status ? ` (HTTP ${status})` : ''}${transportCause ? ` (transport cause: ${transportCause})` : ''} [request phase: ${phase}]`;
         }
         if ((event.type === 'done' || event.type === 'error') && phase !== 'prepare') {
           const message = event.type === 'done' ? event.message : event.error;
-          if (message.stopReason !== 'aborted' && !options?.signal?.aborted)
+          if (
+            message.stopReason !== 'aborted' &&
+            !options?.signal?.aborted &&
+            (message.stopReason !== 'error' ||
+              !(
+                isRetryableAssistantError(message) ||
+                isContextOverflow(message, target.contextWindow)
+              ))
+          )
             await completeRequest?.(
               message.stopReason === 'error' ? message.errorMessage : undefined,
             );

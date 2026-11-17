@@ -661,6 +661,11 @@ test('server configuration refuses remote exposure without a valid token and an 
     ' https://nod.example',
     'https://nod.example\n',
     'file:///tmp/nod',
+    'https://nod.example:443/assistant',
+    'https://nod.example:443?token=secret',
+    'https://nod.example:443#token',
+    'https://user:password@nod.example:443',
+    'http://nod.example:80',
   ])
     assert.throws(() => serverNetwork({ NOD_PUBLIC_URL, NOD_AUTH_TOKEN: key }));
   const remote = serverNetwork({
@@ -680,7 +685,23 @@ test('server configuration refuses remote exposure without a valid token and an 
     'http://[::1]:4310',
   ])
     assert.equal(serverNetwork({ NOD_PUBLIC_URL }).publicOrigin, NOD_PUBLIC_URL);
+  for (const NOD_PUBLIC_URL of ['https://nod.example:443', 'https://nod.example:443/']) {
+    const defaultPort = serverNetwork({ NOD_PUBLIC_URL, NOD_AUTH_TOKEN: key });
+    assert.equal(defaultPort.publicOrigin, 'https://nod.example');
+    assert.equal(defaultPort.accessOrigin, 'https://nod.example');
+  }
+  for (const NOD_PUBLIC_URL of ['http://localhost:80', 'http://127.0.0.1:80', 'http://[::1]:80'])
+    assert.equal(
+      serverNetwork({ NOD_PUBLIC_URL }).publicOrigin,
+      NOD_PUBLIC_URL.replace(/:80$/, ''),
+    );
   assert.equal(serverNetwork({}).accessOrigin, undefined);
+  assert.equal(serverNetwork({ NOD_AUTH_TOKEN: key }).accessOrigin, undefined);
+  for (const environment of [{ PORT: '80' }, { PORT: '80', NOD_AUTH_TOKEN: key }]) {
+    const defaultPort = serverNetwork(environment);
+    assert.equal(defaultPort.publicOrigin, 'http://localhost');
+    assert.equal(defaultPort.accessOrigin, undefined);
+  }
   assert.equal(serverNetwork({ NOD_DESKTOP: 'true', NOD_AUTH_TOKEN: '' }).authToken, undefined);
 });
 
@@ -792,6 +813,43 @@ test('remote access authenticates cookies and bearer clients only on the configu
     assert.equal((await rotated.inject({ url: '/api/fixture', headers })).statusCode, 401);
 });
 
+test('a server token alone keeps every local address and still refuses a foreign Host', async (t) => {
+  const key = randomBytes(32).toString('base64url');
+  const network = serverNetwork({ NOD_AUTH_TOKEN: key });
+  const app = Fastify({ trustProxy: false });
+  t.after(() => app.close());
+  registerLocalAccess(app, network.port, { key, origin: network.accessOrigin, bearer: true });
+  app.get('/api/privacy', async () => ({ content: null }));
+  for (const host of ['localhost:4310', '127.0.0.1:4310', '[::1]:4310'])
+    assert.equal((await app.inject({ url: '/api/privacy', headers: { host } })).statusCode, 200);
+  assert.equal(
+    (await app.inject({ url: '/api/privacy', headers: { host: 'nod.example' } })).statusCode,
+    403,
+  );
+  const defaultPort = Fastify({ trustProxy: false });
+  t.after(() => defaultPort.close());
+  registerLocalAccess(defaultPort, 80, { key, bearer: true });
+  defaultPort.get('/api/privacy', async () => ({ content: null }));
+  for (const [host, status] of [
+    ['localhost', 200],
+    ['127.0.0.1', 200],
+    ['[::1]', 200],
+    ['localhost:4310', 403],
+  ] as const)
+    assert.equal(
+      (await defaultPort.inject({ url: '/api/privacy', headers: { host } })).statusCode,
+      status,
+    );
+  assert.equal(
+    (
+      await defaultPort.inject({
+        url: '/api/privacy',
+        headers: { host: 'localhost', origin: 'http://localhost' },
+      })
+    ).statusCode,
+    200,
+  );
+});
 test('localhost access requires the owner key and rejects foreign Host, Origin and cross-site requests', async () => {
   const root = await mkdtemp(join(tmpdir(), 'nod-access-'));
   const app = Fastify();
@@ -1655,6 +1713,50 @@ test(
         assert.deepEqual(unusable(), []);
         await finish(declined.turnId, 'cancelled');
       });
+
+      await t.test(
+        'a browser step quoted from informal owner words runs, and uncovered steps still ask',
+        async () => {
+          const request =
+            'no brecho.example.test clica no icone de lapis do anuncio da luminaria, muda o preço p 90 e salva as alteraçoes';
+          const step = (name: string) => ({
+            website: 'https://brecho.example.test',
+            page: 'https://brecho.example.test/minha-loja/anuncios',
+            step: 'click',
+            control: [{ role: 'button', name }],
+            command: { action: 'click', selector: '@e12' },
+          });
+          const turn = await begin(request);
+          for (const because of [
+            '...clica no icone de lapis do anuncio da luminaria',
+            '…salva as alteraçoes',
+            'clica no ícone de lápis do anúncio da luminária',
+            'salva as alterações',
+          ]) {
+            aligned = () => ({ run: true, because });
+            const verdict = await trust.check(turn, 'NOD_browser', step('editar anúncio'));
+            assert.equal(verdict.confirm, false, because);
+            assert.equal(!verdict.confirm && verdict.basis.kind, 'message', because);
+          }
+          for (const because of [
+            'clica no ícone ... salva as alterações',
+            'apaga o anúncio da luminária',
+            '...',
+          ]) {
+            aligned = () => ({ run: true, because });
+            compareVerdict(await trust.check(turn, 'NOD_browser', step('apagar anúncio')), {
+              confirm: true,
+              reason: 'unrequested',
+            });
+          }
+          aligned = false;
+          compareVerdict(await trust.check(turn, 'NOD_browser', step('apagar anúncio')), {
+            confirm: true,
+            reason: 'unrequested',
+          });
+          await finish(turn.turnId, 'cancelled');
+        },
+      );
 
       await t.test('a newer chat correction before action handoff prevents the write', async () => {
         aligned = true;

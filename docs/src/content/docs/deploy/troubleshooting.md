@@ -43,6 +43,12 @@ Keep a copy of the key somewhere safe. Saved credentials can't be read without i
 
 Another program uses port `4310`. Set another `PORT` in `.env` and [apply the configuration](/deploy/configuration/#apply-configuration-changes). Update your browser address and any SSH tunnel to match. A direct source install also needs database port `54329` on `127.0.0.1`; the self-hosting stack keeps its database port private.
 
+### This host is not permitted.
+
+When `NOD_PUBLIC_URL` is set, Nod answers only at that address. The Docker setup always sets it (by default to `http://localhost:4310`). A request for any other host gets this error. That includes `127.0.0.1`, `localhost` after you set an HTTPS address, and a reverse proxy that changes the `Host` header. Without `NOD_PUBLIC_URL`, Nod answers only at `localhost`, `127.0.0.1` and `[::1]` on its own port.
+
+Open Nod at that exact address, and make sure a reverse proxy passes the public `Host` header through unchanged. To use another address, change `NOD_PUBLIC_URL` and [apply the configuration](/deploy/configuration/#apply-configuration-changes). Nod accepts one address at a time.
+
 ### You lost the access link
 
 For a local source install without `NOD_AUTH_TOKEN`, Nod prints a link with `#access=` when it starts, and your browser keeps the cookie. To get a new link, delete `access-key` in your data folder (`.local/` by default) and restart. A server configured with `NOD_AUTH_TOKEN` prints its address without that link; use its configured token, or follow [Rotate access](/deploy/server-operations/#rotate-access).
@@ -52,6 +58,8 @@ For a local source install without `NOD_AUTH_TOKEN`, Nod prints a link with `#ac
 ### Linux cannot start its private computer
 
 A local Linux desktop assistant requires hardware virtualization and access to `/dev/kvm`. Check that virtualization is enabled in your firmware and that your Linux account can use KVM. On distributions with a `kvm` group, your account must belong to it. Sign out and back in after a group change, then reopen Nod. Nod does not use software emulation as a fallback.
+
+If an older build reported `copy_file_range failed: invalid argument`, install the latest Nod bundle and retry. Nod now uses normal reads and writes to copy its first guest image. It verifies the complete copy before Lima can use it. An older empty disk is replaced only after Nod checks that every byte is zero and stops the computer. Disks with other data are kept.
 
 ### Linux cannot save or unlock keys
 
@@ -93,6 +101,10 @@ On Windows, the message reads "Nod needs more free disk space to prepare its pri
 
 Retry first. Do not delete the profile, VM, database, or runtime cache by hand to fix it. If it still fails, [send feedback](#send-feedback-with-a-diagnostic-report). If the chat cannot open, select **Show startup log** on the error screen. Send that log with a screenshot of the error. When a setup command fails, the message includes the last lines of its output.
 
+On Mac and Linux, Nod records new first setups and marks them complete after the computer passes its startup checks. If a recorded setup fails or is interrupted, the next attempt replaces the unfinished computer. A failed replacement reports its own error and stops the attempt. Computers that completed setup are kept. Missing configuration for an existing computer also stops setup and keeps its files.
+
+An interrupted Mac setup from an older version can lack that record. If retry still fails, keep its files and [send feedback with the startup log](#send-feedback-with-a-diagnostic-report).
+
 If the background service does not respond within two minutes, the startup log records the elapsed wait and the last health check failure. It also records whether the service reported its port. An unexpected service exit has a separate log entry.
 
 On a Mac, setup keeps runtime files that passed their checks, even if a later download fails. **Try again** checks and reuses those files. It does not remove a verified image while the private computer loads it.
@@ -104,6 +116,10 @@ On a Mac, **Technical details** and the startup log also show the cause of a run
 Quit Nod and open it again. If the error continues, restart Windows. Keep your app data. WSL setup errors also include the original Windows error.
 
 To start over, select **Remove all data…** in the **Nod** menu. Nod deletes your profile and private computer, then restarts and opens setup. See [Remove Nod](/get-started/install-desktop/#remove-nod) for what it keeps.
+
+### Windows keeps offering the same update
+
+Nod versions before 0.7.0 on Windows can't install their own updates. Quit Nod from the tray icon, then run the latest installer as described in [Update Nod](/get-started/install-desktop/#update-nod). It keeps your profile, keys and data. Don't uninstall Nod or delete its folders first.
 
 ### Windows says WSL is missing
 
@@ -127,7 +143,11 @@ ChatGPT sign-in receives its callback on port 1455. Another Nod app or another s
 
 Return to **Apps** and select **Connect** again. Keep the sign-in page and any window it opens until authorization finishes. A copied, expired or already used link cannot finish a connection. If the system's encrypted storage is locked, unlock it and restart Nod.
 
-If the connection service is unavailable or reports a limit, try again later. If the problem persists, [send feedback with a diagnostic report](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report).
+If the connection service refuses the request, the sign-in page names its reason and HTTP status, such as `public_budget_exceeded` and `HTTP 429`. If the connection service is unavailable or reports a limit, try again later. If the problem persists, [send feedback with a diagnostic report](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report).
+
+### An app tool fails with HTTP 403
+
+If an app tool error shows `HTTP 403` and a UTC time, [send feedback with a diagnostic report](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report). Include that time and any Cloudflare Ray ID in your feedback text. The displayed `0x` is a formatting prefix; support removes it before searching Cloudflare.
 
 ### App sign-in opens an unreachable address on a remote server
 
@@ -192,29 +212,38 @@ To report a bug, use the [bug report form](https://github.com/n8n-io/nod/issues/
 
 The `nod-feedback-report-v3` JSON attachment connects the steps before a failure with the affected chat, agent work, app usage, and connections. It helps with support, debugging, and product improvement. It combines technical metadata with recent content after best-effort redaction.
 
-| Section                 | What it shows                                                                                                                                                                                         |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Runtime                 | App version, release, platform, known model provider, and model family.                                                                                                                               |
-| Chat                    | Recent user and assistant message text, roles, character and attachment counts, and reply metadata.                                                                                                   |
-| Turns and agent work    | Request source, channel, outcome, waiting state, queue and run duration, tool category, parent-child relationships, and whether a background check stopped at screening (its outcome shows the rest). |
-| Model usage             | Request outcomes, duration, token counts, recorded cost and estimates, and known model categories and operations.                                                                                     |
-| Tasks and schedules     | State, progress counts, enabled state, overdue work, and recent run and failure counts.                                                                                                               |
-| Connections             | Managed app, browser, direct connection, and model connection state, plus reconnect and event-delivery health.                                                                                        |
-| Channels                | Receiving and delivery states, with a permitted failure reason.                                                                                                                                       |
-| Runtime logs            | Recent tool inputs and results, application and background failures, error messages, validation issues and stacks, and connection activity.                                                           |
-| App activity and errors | Recent screen categories, API failure categories and status codes, UI errors, and captured app error messages and stacks.                                                                             |
+| Section                 | What it shows                                                                                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Runtime                 | App version, release, platform, known model provider, model family, selected model ID, reasoning effort, model routes, and the trust check mode.                                                       |
+| System                  | The time the report was prepared, time zone, operating system and its version, CPU count, memory, Node.js, Electron and database versions, runtime uptime, and whether Nod runs in a container.        |
+| Settings                | Locale, time zone, quiet hours, whether automatic preparation, local files, a notification rule or rules are set, spending limits, and each chat app's mode and link state. Rule text isn't included.  |
+| Chat                    | Recent user and assistant message text, roles, character and attachment counts, and reply metadata.                                                                                                    |
+| Turns and agent work    | Request source, channel, outcome, waiting state, queue and run duration, tool category, parent-child relationships, and whether a background check stopped at screening (its outcome shows the rest).  |
+| Model usage             | Request outcomes, duration, token counts, recorded cost and estimates, model IDs, known model categories and operations, and a 24-hour summary by model and operation.                                 |
+| Tasks and schedules     | State, progress counts, enabled state, overdue work, and recent run and failure counts.                                                                                                                |
+| Connections             | Managed app, browser, direct connection, and model connection state, plus reconnect and event-delivery health.                                                                                         |
+| Channels                | Receiving and delivery states, with a permitted failure reason.                                                                                                                                        |
+| Runtime logs            | Recent tool inputs and results, and connection activity.                                                                                                                                               |
+| Failures                | Application and background failures with error class, message, stack with source file names, status, exit code and process output. A repeated failure appears once with a count.                       |
+| Startup log             | Desktop startup, runtime preparation and update steps: versions, update check, download, install and restart results, and exit codes.                                                                  |
+| App activity and errors | Recent screen categories, API failure categories and status codes, UI errors, failed requests with the server's reason, live update disconnects, and captured app error messages and stacks.           |
+| App window              | Whether the window was online and visible, the live update connection state, the age of the last update, saved and displayed message counts, window size, locale, and clock difference to the runtime. |
 
-Database activity covers the latest 24 hours for your account across its conversations and background work. Each database section includes at most 200 entries, or 400 for agent execution events. Connection and schedule sections show current state. Report-local labels preserve execution relationships without exporting their original IDs. Activity uses relative ages and durations.
+Database activity covers the latest 24 hours for your account across its conversations and background work. Each database section includes at most 200 entries, or 400 for agent execution events. Connection and schedule sections show current state. Report-local labels preserve execution relationships without exporting their original IDs. Activity uses relative ages and durations. The report carries one absolute time: when it was prepared.
 
-The runtime journal uses three rotating files of at most 1 MiB each in Nod's private data folder. Data is redacted before it is written and again when it is exported. Reports include up to 200 journal entries from the latest 24 hours. An entry larger than 64 KiB is replaced with an omission marker. Expired records are removed on startup, report preparation, subsequent journal writes, and a one-minute cleanup timer. Files can remain while Nod is stopped. Dropped entries and unavailable journal data are identified in the report.
+The runtime journal uses three rotating files of at most 1 MiB each in Nod's private data folder. Data is redacted before it is written and again when it is exported. Failures have their own journal with the same limits, so tool activity can't push them out. Reports include up to 200 runtime log entries from the latest 24 hours. Identical failures are merged into one entry with a count and the age of the first one, and a report includes up to 150 merged failures. A failure that repeats within 10 minutes is counted and written with the next one, so its count can lag by that long. A tool result longer than 6,000 characters keeps its start and end. An entry larger than 64 KiB is replaced with an omission marker. Expired records are removed on startup, report preparation, subsequent journal writes, and a one-minute cleanup timer. Files can remain while Nod is stopped. Dropped entries and unavailable journal data are identified in the report.
 
 The separate app activity buffer holds up to 100 recent entries for 30 minutes in the current runtime and app window. The app window also keeps up to 10 recent error messages and stacks for 30 minutes. These buffers don't depend on usage analytics being enabled. Closing the app window or restarting the runtime clears that source's buffer. Dropped or expired activity entries aren't marked. Activity categories contain no raw request URLs or response bodies. App error messages and stacks reach the runtime for redaction when a report is prepared and aren't written to its journal. After an account change, error capture pauses until the app window reloads, and the report marks that source unavailable.
 
 The redactor omits individual strings longer than 32,000 characters before scanning them. Database reads separately omit message and error text larger than 64 KiB. When content is included, absent message text and turn errors have no field; a content-limit marker means a stored value exceeded that read limit. App error messages and stacks each have an 8,192-character capture limit. Structured values also have depth, entry-count, and size limits. These limits can remove details from long messages and tool results.
 
-The report includes a coverage record for each database section and the runtime journal: collection status, entry count, and omitted-entry indicators. These markers do not count entries dropped or expired from the app activity and error buffers. The final attachment is capped at 512 KiB. Older entries are removed if needed, and their sections mark that truncation. An empty or incomplete section doesn't prove that no problem occurred.
+The report includes a coverage record for each database section and the runtime journal: collection status, entry count, and omitted-entry indicators. These markers do not count entries dropped or expired from the app activity and error buffers. The final attachment is capped at 512 KiB. Older entries are removed if needed, and their sections mark that truncation. Failures, the startup log and settings are removed last. An empty or incomplete section doesn't prove that no problem occurred.
 
-The report excludes credential fields, screenshots, binary data, system prompts, and model thinking. Text returned by a file, browser, or app tool can be included after redaction. Redaction can miss personal details, so review the complete attachment and leave it out if needed. A report also cannot recover details outside its time or size limits.
+A model ID is included only when every word in it is a known public model, vendor or variant name. Any other ID is left out, and the model family stays. A stack frame keeps its file only when the file is inside Nod's own source folders or a dependency. Every other file path is masked.
+
+The desktop app writes the startup log to `logs/startup.log` in its profile folder. When the file passes 64 KiB, the app keeps its newest half before the next entry. Reports read the final 48 KB and include up to its last 200 lines after redaction. The section is marked when older lines were left out.
+
+The report excludes credential fields, screenshots, binary data, system prompts, model thinking, the computer name, and account names. Text returned by a file, browser, or app tool can be included after redaction. Redaction can miss personal details, so review the complete attachment and leave it out if needed. A report also cannot recover details outside its time or size limits.
 
 The report setting does not enable [usage analytics or conversation traces](/trust/privacy/).
 
