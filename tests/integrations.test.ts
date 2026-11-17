@@ -7746,10 +7746,40 @@ test(
       'http://93.184.216.34/mcp',
       'http://127.0.0.1:4931/mcp?token=synthetic',
       'http://user:synthetic@127.0.0.1:4931/mcp',
+      'ftp://127.0.0.1:4931/mcp',
+      'file:///synthetic/mcp',
+      'data:text/plain,synthetic',
     ]) {
       const rejected = await create(endpoint);
       assert.equal(rejected.statusCode, 400, rejected.body);
     }
+    const service = 'mcp-synthetic-local';
+    await pool.query(
+      `INSERT INTO discovered_connections (id,owner_id,service,name,account_name,paths,reconnect_required)
+       VALUES($1,$2,$3,'Local MCP','Local MCP',$4,true)`,
+      [
+        randomUUID(),
+        ownerId,
+        service,
+        JSON.stringify([
+          {
+            id: randomUUID(),
+            kind: 'mcp',
+            endpoint: 'http://127.0.0.1:4931/mcp',
+            auth: 'bearer',
+            local: true,
+          },
+        ]),
+      ],
+    );
+    const reconnected = await connections.reconnect(service);
+    const renewed = (
+      await pool.query('SELECT paths FROM discovered_connection_proposals WHERE id=$1', [
+        new URL(reconnected.url, 'http://localhost').searchParams.get('connect'),
+      ])
+    ).rows[0];
+    assert.equal(renewed.paths[0].endpoint, 'http://127.0.0.1:4931/mcp');
+    assert.equal(renewed.paths[0].local, true);
     const proposed = await connections
       .propose({
         name: 'Proposed',

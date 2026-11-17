@@ -1256,7 +1256,10 @@ export async function createDiscoveredConnections(
     );
     const row = rows.rows[0];
     if (!row) throw error('This service is unavailable.', 404);
-    return propose(
+    const localOrigin = row.paths.flatMap((path) =>
+      path.kind !== 'cli' && path.local ? [new URL(path.endpoint).origin] : [],
+    )[0];
+    const { id, name } = await create(
       {
         service,
         name: row.name,
@@ -1284,7 +1287,9 @@ export async function createDiscoveredConnections(
       },
       undefined,
       returnTo,
+      localOrigin,
     );
+    return { name, url: `/apps?connect=${id}` };
   }
   async function search(query: string, connectionId?: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
@@ -1530,7 +1535,7 @@ export async function createDiscoveredConnections(
       const parsed = z
         .object({
           name: proposalSchema.shape.name,
-          endpoint: z.url().max(2048),
+          endpoint: z.url({ protocol: /^https?$/ }).max(2048),
           auth: z.enum(['oauth', 'bearer', 'x-api-key']),
           clientIdRequired: z.boolean().optional(),
         })

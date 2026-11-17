@@ -94,7 +94,7 @@ export function ManualMcpDialog({
               name="endpoint"
               type="url"
               placeholder="https://example.com/mcp"
-              pattern="[Hh][Tt][Tt][Pp][Ss]://.*"
+              pattern="[Hh][Tt][Tt][Pp][Ss]?://.*"
               required
               maxLength={2048}
               spellCheck={false}
